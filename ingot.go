@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"github.com/fsouza/go-dockerclient"
 	"bufio"
+	"net/url"
 	"os"
 	"net"
 	"net/http"
@@ -18,62 +19,173 @@ import (
 	"crypto"
 	"io/ioutil"
 	"net/http/httputil"
+	"time"
 )
 
 var (
+	rsaKey *rsa.PrivateKey
+	rsaCertLoc = "sample.pem"
 	EOFEvent = map[string]string{"Status": "EOF"}
+	dockerURL = "unix:///var/run/docker.sock"
+	parsedURL *url.URL
+	pemFile = "sample.pem"
+	caPem string
+	caCert string
+	caKey string
+	dockerClient *docker.Client
+	logTargetURL = "https://logs.dockcha.in/api/1/post-logs"
 )
 
-// recursively walk the JSONish data and find
-// all float64 and float32 elements that can be represented
-// as int64 and convert them
-func fixFloat64(info interface{}) interface{} {
-	switch v := info.(type) {
-	case map[string]interface{}:
-		ret := map[string]interface{}{}
-		for k,tv := range v {
-			ret[k] = fixFloat64(tv)
-		}
-		return ret
-	case []interface{}:
-		ret := make([]interface{}, len(v))
-		for k,tv := range v {
-			ret[k] = fixFloat64(tv)
-		}
-		return ret
-	case float64:
-		if v == float64(int64(v)) {
-			return int64(v)
-		} else {
-			return v
-		}
-	case float32:
-		if v == float32(int64(v)) {
-			return int64(v)
-		} else {
-			return v
-		}
+// initialize the global vars
+func setMeUp() {
+	var err error
+
+	// define an alternative place for the RSA private key
+	// used for signing the JSON blobs
+	if certLoc := os.Getenv("INGOT_CERT_LOC") ; len(certLoc) != 0 {
+		rsaCertLoc = certLoc
 	}
-	return info
+
+	// get the file and decode it
+	dat, err2 := ioutil.ReadFile(rsaCertLoc)
+	
+	if err2 != nil {
+		panic(err)
+	}
+	
+	block, _ := pem.Decode(dat)
+
+	rsaKey, err = x509.ParsePKCS1PrivateKey(block.Bytes)
+
+
+	// Figure out the Docker Host... do we use the
+	// default /var/run/docker.sock or something else?
+
+	if url := os.Getenv("DOCKER_HOST"); len(url) != 0 {
+		dockerURL = url
+	}
+
+	parsedURL, err = url.Parse(dockerURL)
+
+	if err != nil {
+		panic(err)
+	}
+
+	// If there's CERT path information, slurp it in
+	if certPath := os.Getenv("DOCKER_CERT_PATH"); len(certPath) != 0 {
+		caPem = fmt.Sprintf("%s/ca.pem", certPath)
+		caCert = fmt.Sprintf("%s/cert.pem", certPath)
+		caKey = fmt.Sprintf("%s/key.pem", certPath)
+		dockerClient, err = docker.NewTLSClient(dockerURL, caCert,
+			caKey, caPem)
+	} else {
+		dockerClient, err = docker.NewClient(dockerURL)
+	}
+
+
+	// if there was an error creating the client, bail
+	if err != nil {
+		panic(err)
+	}
+
+	// set up the target log host
+	if url := os.Getenv("TARGET_LOG_HOST"); len(url) != 0 {
+		logTargetURL = url
+	}
+
 }
 
-func signBytes(bytes []byte, key *rsa.PrivateKey) (s[]byte, err error) {
+func signBytes(bytes []byte) (s[]byte, err error) {
 	hasher := sha256.New()
 	hasher.Write( bytes)
 	hash := hasher.Sum(nil)
 	var h crypto.Hash
 	
-	return rsa.SignPKCS1v15(rand.Reader, key, h, hash)
+	return rsa.SignPKCS1v15(rand.Reader, rsaKey, h, hash)
+}
+
+func postInfo(info []interface{}) {
+	fmt.Println("posting ", info)
+}
+
+func aggregate(incoming chan interface{}) {
+	buffer := make([]interface{}, 0)
+	timeout := time.After(time.Second * 5)
+
+	sendIt := func () {
+		if len(buffer) > 0 {
+			go postInfo(buffer)
+			buffer = make([]interface{}, 0)
+		}
+		timeout = time.After(time.Second * 5)
+	}
+	
+	for {
+		select {
+		case evt := <- incoming:
+			buffer = append(buffer, evt)
+			if len(buffer) > 250 {
+				sendIt()
+			}
+
+		case <- timeout:
+			sendIt()
+		}
+	}
+}
+
+type inspect struct {
+	name string
+}
+
+type history struct {
+	name string
+}
+
+
+
+func imageFetcher(requests, aggregatorChan chan interface{}) {
+	known := map[string]bool{}
+
+	for req := range requests {
+		switch r := req.(type) {
+		case string:
+			if !known[r] {
+				known[r] = true
+			}
+			// dockerClient.
+		case inspect:
+			if !known[r.name] {
+				known[r.name] = true
+			}
+		case history:
+			if !known[r.name] {
+				known[r.name] = true
+			}
+		}
+	}
+}
+
+func processJSONMessages(msgChan, aggregateChan, imageHistoryListener chan interface{}) {
+	for evt := range msgChan {
+		aggregateChan <- evt // aggregate it
+
+		// if it's a "create" message, then 
+		// post the image information
+		switch e := evt.(type) {
+		case map[string]interface{}:
+			switch e["status"].(string) {
+			case "create":
+				if from := e["from"].(string); len(from) != 0 {
+					imageHistoryListener <- from
+				}
+			}
+		}
+	}
 }
 
 func main() {
-	dat, _ := ioutil.ReadFile("sample.pem")
-	
-	block, _ := pem.Decode(dat)
-
-	key, _ := x509.ParsePKCS1PrivateKey(block.Bytes)
-
-	fmt.Println("Key ", key)
+	setMeUp()
 
 	input := make(chan interface{})
 
@@ -83,14 +195,15 @@ func main() {
 		input <- line
 	}()
 
-	// FIXME deal with the endpoint
-	endpoint := "unix:///var/run/docker.sock"
-	
-	client, _ := docker.NewClient(endpoint)
+	// don't backup
+	eventListener := make(chan interface{}, 1000)
 
-	mapListener := make(chan interface{}, 10)
+	// never, ever backup
+	imageHistoryListener := make(chan interface{}, 5000)
 	
 	errChan := make(chan error, 10)
+
+	aggregatorChan := make(chan interface{}, 500)
 
 	go func() {
 		for evt := range errChan {
@@ -98,54 +211,38 @@ func main() {
 		}
 	}()
 
+	go aggregate(aggregatorChan)
 
-	go func() {
-		for evt := range mapListener {
-			evt = fixFloat64([]interface{}{evt})
-			// switch t := evt.(type) {
-			// case map[string]interface{}:
-			// 	if tmp, v := t["time"].(float64); v {
-			// 		fmt.Println("Are they eq?", tmp == float64(int64(tmp)))
-			// 		t["time"] = int64(tmp)
-			// 	}
-			// 	switch v := t["time"].(type) {
-			// 	case int:
-			// 		fmt.Println("V is an int", v)
-			// 	case float64:
-			// 		fmt.Println("V is ", int(v))
-			// 	default:
-			// 		fmt.Println("Type", reflect.TypeOf(v))
-			// 	}
-			// 	fmt.Println("Time type: ", t["time"])
-			// 	fmt.Println("yak type: ", t["yak"])
-			// }
+	go imageFetcher(imageHistoryListener, aggregatorChan)
 
-			marshalled, _ := json.Marshal(evt)
-			signed, _ := signBytes(marshalled, key)
-			fmt.Println("Signed ", signed)
+	go processJSONMessages(eventListener, aggregatorChan, 
+		imageHistoryListener)
 
-			fmt.Println("encoded: ", string(marshalled[:]))
-		}
-	}()
+	// go func() {
+	// 	for evt := range mapListener {
+	// 		marshalled, _ := json.Marshal(evt)
+	// 		signed, _ := signBytes(marshalled)
+	// 		fmt.Println("Signed ", signed)
 
-	eventHijack("unix", "/var/run/docker.sock", 
-		client, 0, mapListener, errChan)
+	// 		fmt.Println("encoded: ", string(marshalled[:]))
+	// 	}
+	// }()
 
-	listener := make(chan *docker.APIEvents, 10)
+	ehErr := eventHijack(0, eventListener, errChan)
 
-	go func() {
-		for evt := range listener {
-			fmt.Println(evt)
-		}
-	}()
-
-	client.AddEventListener(listener)
+	if ehErr != nil {
+		panic(ehErr)
+	}
 
 	fmt.Println("Press 'enter' to stop")
 	<- input
 }
 
-func eventHijack(protocol string, address string, client *docker.Client, startTime int64, eventChan chan interface{}, errChan chan error) error {
+func eventHijack( startTime int64, eventChan chan interface{}, errChan chan error) error {
+	client := dockerClient
+	protocol := parsedURL.Scheme
+	address := parsedURL.Path
+
 	tlsConfig := client.TLSConfig
 
 	uri := "/events"
@@ -178,6 +275,7 @@ func eventHijack(protocol string, address string, client *docker.Client, startTi
 		defer conn.Close()
 		defer res.Body.Close()
 		decoder := json.NewDecoder(res.Body)
+		decoder.UseNumber()
 		for {
 			var event interface{}
 			if err = decoder.Decode(&event); err != nil {
