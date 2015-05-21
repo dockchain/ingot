@@ -20,10 +20,14 @@ import (
 	"io/ioutil"
 	"net/http/httputil"
 	"time"
+	"regexp"
+	"encoding/base64"
 )
 
 var (
 	rsaKey *rsa.PrivateKey
+	publicKey crypto.PublicKey
+	publicKeyPem string
 	rsaCertLoc = "sample.pem"
 	EOFEvent = map[string]string{"Status": "EOF"}
 	dockerURL = "unix:///var/run/docker.sock"
@@ -34,6 +38,7 @@ var (
 	caKey string
 	dockerClient *docker.Client
 	logTargetURL = "https://logs.dockcha.in/api/1/post-logs"
+	shaRE = regexp.MustCompile("^[0-9a-fA-F]*$")
 )
 
 // initialize the global vars
@@ -48,15 +53,36 @@ func setMeUp() {
 
 	// get the file and decode it
 	dat, err2 := ioutil.ReadFile(rsaCertLoc)
-	
+
 	if err2 != nil {
 		panic(err)
 	}
-	
+
 	block, _ := pem.Decode(dat)
 
 	rsaKey, err = x509.ParsePKCS1PrivateKey(block.Bytes)
 
+	if err != nil {
+		panic(err)
+	}
+
+
+	publicKey = rsaKey.Public()
+
+	publicKeyDer, err98 := x509.MarshalPKIXPublicKey(publicKey)
+	if err98 != nil {
+		panic(err98)
+	}
+
+	publicKeyBlock := pem.Block{
+		Type:    "PUBLIC KEY",
+		Headers: nil,
+		Bytes:   publicKeyDer,
+	}
+	publicKeyPem = string(pem.EncodeToMemory(&publicKeyBlock))
+
+
+	fmt.Println(publicKeyPem)
 
 	// Figure out the Docker Host... do we use the
 	// default /var/run/docker.sock or something else?
@@ -100,12 +126,22 @@ func signBytes(bytes []byte) (s[]byte, err error) {
 	hasher.Write( bytes)
 	hash := hasher.Sum(nil)
 	var h crypto.Hash
-	
+
 	return rsa.SignPKCS1v15(rand.Reader, rsaKey, h, hash)
 }
 
-func postInfo(info []interface{}) {
-	fmt.Println("posting ", info)
+func postInfo(info interface{}) {
+	bytes, e1 := json.Marshal(info)
+	if e1 != nil {
+		fmt.Println(e1)
+		return
+	}
+
+	toSend := map[string]interface{}{"version": 1,
+		"type": "ingot_post",
+		"data": info,
+		"pubKey": publicKeyPem,
+		"raw": }
 }
 
 func aggregate(incoming chan interface{}) {
@@ -119,7 +155,7 @@ func aggregate(incoming chan interface{}) {
 		}
 		timeout = time.After(time.Second * 5)
 	}
-	
+
 	for {
 		select {
 		case evt := <- incoming:
@@ -134,33 +170,46 @@ func aggregate(incoming chan interface{}) {
 	}
 }
 
-type inspect struct {
-	name string
-}
 
 type history struct {
 	name string
 }
 
+func isSHA(s string) bool {
+	return len(s) == 64 && s == shaRE.FindString(s)
+}
 
 
 func imageFetcher(requests, aggregatorChan chan interface{}) {
 	known := map[string]bool{}
 
+
 	for req := range requests {
 		switch r := req.(type) {
 		case string:
-			if !known[r] {
-				known[r] = true
+			if len(r) > 0 && (!isSHA(r) || !known[r]) {
+				answer, err := dockerClient.InspectImage(r)
+				if err == nil {
+					if !known[answer.ID] {
+						aggregatorChan <-
+							map[string]interface{}{"imageinfo": *answer}
+
+						requests <- answer.Parent
+						requests <- history{answer.ID}
+						known[answer.ID] = true
+					}
+				}
 			}
-			// dockerClient.
-		case inspect:
-			if !known[r.name] {
-				known[r.name] = true
-			}
+
 		case history:
 			if !known[r.name] {
-				known[r.name] = true
+				answer, err := dockerClient.ImageHistory(r.name)
+				if err == nil {
+					aggregatorChan <-
+						map[string]interface{}{"imageHistory": answer}
+
+					known[r.name] = true
+				}
 			}
 		}
 	}
@@ -170,7 +219,7 @@ func processJSONMessages(msgChan, aggregateChan, imageHistoryListener chan inter
 	for evt := range msgChan {
 		aggregateChan <- evt // aggregate it
 
-		// if it's a "create" message, then 
+		// if it's a "create" message, then
 		// post the image information
 		switch e := evt.(type) {
 		case map[string]interface{}:
@@ -200,7 +249,7 @@ func main() {
 
 	// never, ever backup
 	imageHistoryListener := make(chan interface{}, 5000)
-	
+
 	errChan := make(chan error, 10)
 
 	aggregatorChan := make(chan interface{}, 500)
@@ -215,7 +264,7 @@ func main() {
 
 	go imageFetcher(imageHistoryListener, aggregatorChan)
 
-	go processJSONMessages(eventListener, aggregatorChan, 
+	go processJSONMessages(eventListener, aggregatorChan,
 		imageHistoryListener)
 
 	// go func() {
@@ -257,7 +306,7 @@ func eventHijack( startTime int64, eventChan chan interface{}, errChan chan erro
 	if tlsConfig == nil {
 		dial, err = net.Dial(protocol, address)
 	} else {
-		dial, err = tls.Dial(protocol, address, tlsConfig)
+		dial, err = tls.Dial(protocol, parsedURL.Host, tlsConfig)
 	}
 	if err != nil {
 		return err
@@ -279,7 +328,7 @@ func eventHijack( startTime int64, eventChan chan interface{}, errChan chan erro
 		for {
 			var event interface{}
 			if err = decoder.Decode(&event); err != nil {
-				if err == io.EOF || err == io.ErrUnexpectedEOF {					
+				if err == io.EOF || err == io.ErrUnexpectedEOF {
 					eventChan <- EOFEvent
 					break
 				}
