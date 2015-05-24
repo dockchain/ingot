@@ -35,7 +35,7 @@ By default, the target service is DockChain, but the target can
 be changed with a configuration option.
 
 This is [David Pollak](https://github.com/dpp)'s first Go project,
-so the code will be both non-idiomatic and probably crapping. Feel
+so the code will be both non-idiomatic and probably crappy. Feel
 free to open pull requests.
 
 ## How/Where to communicate
